@@ -153,7 +153,8 @@
 <script>
 (() => {
   // ---- Tunables -------------------------------------------------------------
-  const BRUSH_RADIUS = 26;        // CSS px
+  const PEN_SIZES = [4, 7, 11, 16, 21, 26, 32, 40, 50];   // brush radius in CSS px for keys 1–9
+  let BRUSH_RADIUS = PEN_SIZES[5];  // current pen; change with the number keys
   const MASK_SCALE = 0.5;         // fog mask resolution relative to CSS px
   const REGROW_EVERY_MS = 250;    // how often the fog creeps back
   const REGROW_ALPHA = 0.012;     // how much fog returns each step
@@ -348,7 +349,10 @@
     noteContact(pointers.get(e.pointerId), e);
     stamp(e.clientX, e.clientY, r);
   });
+  let mouse = null;   // hover position, to show the pen size around the mouse
+  view.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') mouse = null; });
   view.addEventListener('pointermove', e => {
+    if (e.pointerType === 'mouse') mouse = { x: e.clientX, y: e.clientY };
     const p = pointers.get(e.pointerId);
     if (!p) return;
     const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
@@ -642,6 +646,28 @@
     for (let i = hands.length - 1; i >= 0; i--) if (!hands[i].seen) hands.splice(i, 1);
   }
 
+  // Number keys 1–9 pick the pen size (1 = thinnest).
+  window.addEventListener('keydown', e => {
+    if (e.ctrlKey || e.metaKey || e.altKey || !started) return;
+    const n = Number(e.key);
+    if (!Number.isInteger(n) || n < 1 || n > 9) return;
+    BRUSH_RADIUS = PEN_SIZES[n - 1];
+    for (const h of hands) h.r = BRUSH_RADIUS;
+    toast(`Pen size ${n}`, 1200);
+  });
+
+  function drawMouseCursor() {
+    if (!mouse || pointers.size) return;
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.beginPath();
+    ctx.arc(mouse.x, mouse.y, BRUSH_RADIUS, 0, Math.PI * 2);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = 'rgba(255,255,255,.7)';
+    ctx.stroke();
+    ctx.restore();
+  }
+
   function drawHandCursors() {
     if (!handsOn || !hands.length) return;
     ctx.save();
@@ -697,6 +723,7 @@
     // 4. Composite.
     ctx.drawImage(fog, 0, 0);
     drawHandCursors();
+    drawMouseCursor();
     if (DEBUG) drawDebug();
 
     requestAnimationFrame(frame);
