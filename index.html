@@ -66,6 +66,26 @@
     z-index: 1;
   }
   #controls button { padding: 10px 18px; font-size: .9rem; }
+  #controls button[aria-pressed="true"] { background: rgba(159,227,255,.3); border-color: rgba(159,227,255,.7); }
+
+  #toast {
+    position: fixed;
+    left: 50%;
+    top: max(20px, env(safe-area-inset-top));
+    transform: translateX(-50%);
+    z-index: 1;
+    pointer-events: none;
+    background: rgba(0,0,0,.55);
+    border-radius: 999px;
+    padding: 10px 18px;
+    font-size: .9rem;
+    text-align: center;
+    max-width: calc(100vw - 32px);
+    box-sizing: border-box;
+    opacity: 0;
+    transition: opacity .4s;
+  }
+  #toast.show { opacity: 1; }
 
   #mic {
     position: fixed;
@@ -116,7 +136,10 @@
 
 <div id="debug" hidden></div>
 
+<div id="toast"></div>
+
 <div id="controls">
+  <button id="hands" hidden aria-pressed="false" title="Draw by pointing at the camera">Hand tracking</button>
   <button id="breathe" title="Fog the mirror up again">Breathe</button>
 </div>
 
@@ -507,6 +530,134 @@
     blurCtx.drawImage(prev, 0, 0, bw, bh);
   }
 
+  // ---- Hand tracking (for screens without touch) ----------------------------
+  // Point with your index finger to draw; any other hand shape just moves the cursor.
+  const MEDIAPIPE = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1';
+  const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+  const POINT_FRAMES = 2;         // frames a pose must hold before drawing starts/stops
+  const HAND_SMOOTHING = 0.5;     // 0 = frozen, 1 = raw (jittery) fingertip position
+
+  const handsBtn = document.getElementById('hands');
+  const toastEl = document.getElementById('toast');
+  const hasTouch = matchMedia('(any-pointer: coarse)').matches || navigator.maxTouchPoints > 0;
+  let handLandmarker = null, handsLoading = false, handsOn = false;
+  let lastVideoTime = -1;
+  const hands = [];               // per detected hand: { x, y, r, drawing, streak, seen }
+
+  let toastTimer = 0;
+  function toast(text, ms = 4000) {
+    toastEl.textContent = text;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    if (ms) toastTimer = setTimeout(() => toastEl.classList.remove('show'), ms);
+  }
+
+  async function setHands(on) {
+    handsOn = on;
+    handsBtn.setAttribute('aria-pressed', String(on));
+    hands.length = 0;
+    if (!on || handLandmarker || handsLoading) {
+      if (on && handLandmarker) toast('Point at the screen with your index finger to draw');
+      return;
+    }
+    handsLoading = true;
+    toast('Loading hand tracking…', 0);
+    try {
+      const { FilesetResolver, HandLandmarker } = await import(`${MEDIAPIPE}/vision_bundle.mjs`);
+      const fileset = await FilesetResolver.forVisionTasks(`${MEDIAPIPE}/wasm`);
+      const opts = delegate => ({
+        baseOptions: { modelAssetPath: HAND_MODEL, delegate },
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
+      try {
+        handLandmarker = await HandLandmarker.createFromOptions(fileset, opts('GPU'));
+      } catch {
+        handLandmarker = await HandLandmarker.createFromOptions(fileset, opts('CPU'));
+      }
+      toast(handsOn ? 'Point at the screen with your index finger to draw' : '');
+    } catch (err) {
+      console.warn('Hand tracking unavailable:', err);
+      setHands(false);
+      handsBtn.hidden = true;
+      toast('Hand tracking isn\u2019t available in this browser — use the mouse instead', 5000);
+    } finally {
+      handsLoading = false;
+    }
+  }
+  handsBtn.addEventListener('click', () => setHands(!handsOn));
+
+  // Map a normalized camera landmark to screen CSS px, matching drawCover (cropped + mirrored).
+  function toScreen(lm) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    const scale = Math.max(cssW / vw, cssH / vh);
+    const dw = vw * scale, dh = vh * scale;
+    return { x: cssW - ((cssW - dw) / 2 + lm.x * dw), y: (cssH - dh) / 2 + lm.y * dh };
+  }
+
+  // A finger counts as extended when its tip is clearly farther from the wrist than its middle joint.
+  function extended(pts, tip, pip) {
+    const w = pts[0];
+    return Math.hypot(pts[tip].x - w.x, pts[tip].y - w.y) > Math.hypot(pts[pip].x - w.x, pts[pip].y - w.y) * 1.15;
+  }
+
+  function updateHands() {
+    if (!handsOn || !handLandmarker || video.readyState < 2) return;
+    if (video.currentTime === lastVideoTime) return;
+    lastVideoTime = video.currentTime;
+    const result = handLandmarker.detectForVideo(video, performance.now());
+
+    for (const h of hands) h.seen = false;
+    result.landmarks.forEach(lms => {
+      const pts = lms.map(toScreen);
+      const tip = pts[8];
+      // Pair with the nearest hand from the previous frame so two hands don't swap strokes.
+      let hand = null, best = Infinity;
+      for (const h of hands) {
+        const d = Math.hypot(h.x - tip.x, h.y - tip.y);
+        if (!h.seen && d < best && d < cssW * 0.25) { best = d; hand = h; }
+      }
+      if (!hand) { hand = { x: tip.x, y: tip.y, r: BRUSH_RADIUS, drawing: false, streak: 0 }; hands.push(hand); }
+      hand.seen = true;
+
+      const pointing = extended(pts, 8, 6) && !extended(pts, 12, 10) && !extended(pts, 16, 14);
+      // Closer hands look bigger, so they get a bigger brush.
+      const handSize = Math.hypot(pts[5].x - pts[0].x, pts[5].y - pts[0].y);
+      const r = Math.max(BRUSH_RADIUS * 0.7, Math.min(BRUSH_RADIUS * 1.8, handSize * 0.25));
+
+      const nx = hand.x + (tip.x - hand.x) * HAND_SMOOTHING;
+      const ny = hand.y + (tip.y - hand.y) * HAND_SMOOTHING;
+      hand.r = hand.r * 0.8 + r * 0.2;
+
+      hand.streak = pointing === hand.drawing ? 0 : hand.streak + 1;
+      if (hand.streak >= POINT_FRAMES) {
+        hand.drawing = pointing;
+        hand.streak = 0;
+        if (pointing) stamp(nx, ny, hand.r);
+      } else if (hand.drawing) {
+        stroke(hand.x, hand.y, nx, ny, hand.r);
+      }
+      hand.x = nx; hand.y = ny;
+    });
+    for (let i = hands.length - 1; i >= 0; i--) if (!hands[i].seen) hands.splice(i, 1);
+  }
+
+  function drawHandCursors() {
+    if (!handsOn || !hands.length) return;
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    for (const h of hands) {
+      ctx.beginPath();
+      ctx.arc(h.x, h.y, h.drawing ? h.r * 0.5 : h.r, 0, Math.PI * 2);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = 'rgba(255,255,255,.8)';
+      ctx.fillStyle = 'rgba(255,255,255,.25)';
+      if (h.drawing) ctx.fill();
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   // ---- Render loop ----------------------------------------------------------
   let last = performance.now();
   function frame(now) {
@@ -514,6 +665,7 @@
     last = now;
 
     regrow(dt);
+    updateHands();
     updateBreath(dt);
     updateDrips(dt);
 
@@ -544,6 +696,7 @@
 
     // 4. Composite.
     ctx.drawImage(fog, 0, 0);
+    drawHandCursors();
     if (DEBUG) drawDebug();
 
     requestAnimationFrame(frame);
@@ -578,6 +731,9 @@
       last = performance.now();
       requestAnimationFrame(frame);
       if (audioCtx) startMic();
+      handsBtn.hidden = false;
+      // No touch screen: draw with your hand in front of the camera instead.
+      if (!hasTouch || new URLSearchParams(location.search).has('hands')) setHands(true);
     } catch (err) {
       msg.textContent = err.name === 'NotAllowedError'
         ? 'Camera permission was denied. Allow it in your browser settings and try again.'
