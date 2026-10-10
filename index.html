@@ -703,6 +703,7 @@
   }
 
   // ---- Startup --------------------------------------------------------------
+  const FULL_PAGE_URL = 'https://madmarcel.github.io/foggy-webcam/';
   const startEl = document.getElementById('start');
   const msg = document.getElementById('msg');
 
@@ -739,6 +740,17 @@
         ? 'Camera permission was denied. Allow it in your browser settings and try again.'
         : `Couldn't start the camera: ${err.message || err.name}`;
       msg.className = 'error';
+      // Embedded pages (e.g. on itch.io) may not be allowed to use the camera at all.
+      if (window.self !== window.top) {
+        msg.textContent = 'The camera isn\u2019t available while Foggy Mirror is embedded on this site.';
+        const link = document.createElement('a');
+        link.href = FULL_PAGE_URL;
+        link.target = '_blank';
+        link.rel = 'noopener';
+        link.textContent = 'Open Foggy Mirror in its own tab';
+        link.style.color = '#fff';
+        msg.append(document.createElement('br'), document.createElement('br'), link);
+      }
     }
   }
 
