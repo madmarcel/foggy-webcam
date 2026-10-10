@@ -1,0 +1,594 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#000">
+<title>Foggy Mirror</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #000;
+    overflow: hidden;
+    overscroll-behavior: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #fff;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100vw;
+    height: 100vh;
+    height: 100dvh;
+    display: block;
+    touch-action: none;
+    cursor: crosshair;
+  }
+  video { display: none; }
+
+  #start {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    padding: 24px;
+    text-align: center;
+    background: radial-gradient(circle at 50% 40%, #3a4650, #12171b);
+    z-index: 2;
+  }
+  #start h1 { margin: 0; font-weight: 300; font-size: 2.2rem; letter-spacing: .04em; }
+  #start p  { margin: 0; opacity: .7; max-width: 28em; line-height: 1.5; }
+  #start .error { color: #ffb4a8; opacity: 1; }
+
+  button {
+    font: inherit;
+    color: inherit;
+    background: rgba(255,255,255,.14);
+    border: 1px solid rgba(255,255,255,.35);
+    border-radius: 999px;
+    padding: 12px 28px;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+  }
+  button:hover { background: rgba(255,255,255,.24); }
+
+  #controls {
+    position: fixed;
+    right: max(16px, env(safe-area-inset-right));
+    bottom: max(16px, env(safe-area-inset-bottom));
+    display: none;
+    gap: 10px;
+    z-index: 1;
+  }
+  #controls button { padding: 10px 18px; font-size: .9rem; }
+
+  #mic {
+    position: fixed;
+    left: max(16px, env(safe-area-inset-left));
+    bottom: max(16px, env(safe-area-inset-bottom));
+    display: none;
+    align-items: center;
+    gap: 8px;
+    font-size: .8rem;
+    opacity: .75;
+    z-index: 1;
+    pointer-events: none;
+    text-shadow: 0 1px 3px rgba(0,0,0,.6);
+  }
+  #mic .level {
+    width: 60px; height: 6px;
+    border-radius: 3px;
+    background: rgba(255,255,255,.25);
+    overflow: hidden;
+  }
+  #mic .level i {
+    display: block; height: 100%; width: 0;
+    background: #fff;
+    transition: background .2s;
+  }
+  #mic.blowing .level i { background: #9fe3ff; }
+
+  #debug {
+    position: fixed;
+    top: max(12px, env(safe-area-inset-top));
+    left: max(12px, env(safe-area-inset-left));
+    z-index: 1;
+    pointer-events: none;
+    font: 12px/1.5 ui-monospace, Menlo, monospace;
+    white-space: pre;
+    background: rgba(0,0,0,.55);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+</style>
+</head>
+<body>
+
+<video id="video" playsinline muted autoplay></video>
+<canvas id="view"></canvas>
+
+<div id="mic"><span>Blow to fog</span><span class="level"><i></i></span></div>
+
+<div id="debug" hidden></div>
+
+<div id="controls">
+  <button id="breathe" title="Fog the mirror up again">Breathe</button>
+</div>
+
+<div id="start">
+  <h1>Foggy Mirror</h1>
+  <p>Your camera becomes a steamed-up mirror. Draw in the fog with your finger, and blow on the screen to fog it up again.</p>
+  <button id="go">Turn on camera</button>
+  <p id="msg"></p>
+</div>
+
+<script>
+(() => {
+  // ---- Tunables -------------------------------------------------------------
+  const BRUSH_RADIUS = 26;        // CSS px
+  const MASK_SCALE = 0.5;         // fog mask resolution relative to CSS px
+  const REGROW_EVERY_MS = 250;    // how often the fog creeps back
+  const REGROW_ALPHA = 0.012;     // how much fog returns each step
+  const FOG_TINT = 'rgba(225, 232, 238, 0.26)';
+  const BLUR_PX = 14;             // blur radius behind the fog, in CSS px
+  const BLUR_RES = 0.25;          // blur is computed at this fraction of screen size
+  const DRIP_CHANCE = 0.035;      // chance per brush stamp to start a drip
+
+  const video = document.getElementById('video');
+  const view = document.getElementById('view');
+  const ctx = view.getContext('2d');
+
+  // Offscreen layers
+  const src = document.createElement('canvas');    // low-res camera frame
+  const blur = document.createElement('canvas');   // blurred camera frame
+  const fog = document.createElement('canvas');    // final fog layer
+  const mask = document.createElement('canvas');   // alpha = fog density
+  const grain = document.createElement('canvas');  // condensation speckle texture
+  const srcCtx = src.getContext('2d');
+  const blurCtx = blur.getContext('2d');
+  // Real Gaussian blur where supported; otherwise fall back to a smooth down/up-sample chain.
+  const hasFilter = (() => { const c = document.createElement('canvas').getContext('2d'); c.filter = 'blur(2px)'; return c.filter === 'blur(2px)'; })();
+  const pyramid = [];
+  const fogCtx = fog.getContext('2d');
+  const maskCtx = mask.getContext('2d');
+
+  let cssW = 0, cssH = 0, dpr = 1;
+  let started = false;
+  let grainPattern = null;
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    cssW = window.innerWidth;
+    cssH = window.innerHeight;
+    const w = Math.round(cssW * dpr), h = Math.round(cssH * dpr);
+
+    view.width = fog.width = w;
+    view.height = fog.height = h;
+    src.width = blur.width = Math.max(16, Math.round(cssW * BLUR_RES));
+    src.height = blur.height = Math.max(16, Math.round(cssH * BLUR_RES));
+    // Fallback: halve until roughly the blur radius, each level smoothing a little more.
+    pyramid.length = 0;
+    let pw = src.width, ph = src.height;
+    for (let r = 1; r < BLUR_PX * BLUR_RES && pw > 8 && ph > 8; r *= 2) {
+      pw = Math.ceil(pw / 2); ph = Math.ceil(ph / 2);
+      const c = document.createElement('canvas');
+      c.width = pw; c.height = ph;
+      pyramid.push(c);
+    }
+
+    // Preserve existing drawings when the mask is resized.
+    const old = started ? copyCanvas(mask) : null;
+    mask.width = Math.round(cssW * MASK_SCALE);
+    mask.height = Math.round(cssH * MASK_SCALE);
+    maskCtx.fillStyle = '#fff';
+    maskCtx.fillRect(0, 0, mask.width, mask.height);
+    if (old) {
+      maskCtx.globalCompositeOperation = 'copy';
+      maskCtx.drawImage(old, 0, 0, mask.width, mask.height);
+      maskCtx.globalCompositeOperation = 'source-over';
+    }
+
+    buildGrain();
+  }
+
+  function copyCanvas(src) {
+    const c = document.createElement('canvas');
+    c.width = src.width; c.height = src.height;
+    c.getContext('2d').drawImage(src, 0, 0);
+    return c;
+  }
+
+  // Fine speckles + a few larger beads, like condensation on glass.
+  function buildGrain() {
+    const size = Math.round(256 * dpr);
+    grain.width = grain.height = size;
+    const g = grain.getContext('2d');
+    g.clearRect(0, 0, size, size);
+    for (let i = 0; i < 1400; i++) {
+      const x = Math.random() * size, y = Math.random() * size;
+      const r = (Math.random() * 0.9 + 0.3) * dpr;
+      g.fillStyle = `rgba(255,255,255,${Math.random() * 0.35})`;
+      g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+    }
+    for (let i = 0; i < 40; i++) {
+      const x = Math.random() * size, y = Math.random() * size;
+      const r = (Math.random() * 2 + 1.2) * dpr;
+      const grad = g.createRadialGradient(x - r * .3, y - r * .3, 0, x, y, r);
+      grad.addColorStop(0, 'rgba(255,255,255,0.55)');
+      grad.addColorStop(1, 'rgba(255,255,255,0.05)');
+      g.fillStyle = grad;
+      g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+    }
+    grainPattern = fogCtx.createPattern(grain, 'repeat');
+  }
+
+  // Draw the video mirrored, cropped to cover the target canvas.
+  function drawCover(c, w, h) {
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh) return;
+    const scale = Math.max(w / vw, h / vh);
+    const dw = vw * scale, dh = vh * scale;
+    c.save();
+    c.translate(w, 0);
+    c.scale(-1, 1);
+    c.drawImage(video, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    c.restore();
+  }
+
+  // ---- Wiping ---------------------------------------------------------------
+  const pointers = new Map();
+  const drips = [];
+
+  function stamp(x, y, r, strength = 1) {
+    const mx = x * MASK_SCALE, my = y * MASK_SCALE, mr = r * MASK_SCALE;
+    const grad = maskCtx.createRadialGradient(mx, my, 0, mx, my, mr);
+    grad.addColorStop(0, `rgba(0,0,0,${strength})`);
+    grad.addColorStop(0.55, `rgba(0,0,0,${strength * 0.9})`);
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    maskCtx.globalCompositeOperation = 'destination-out';
+    maskCtx.fillStyle = grad;
+    maskCtx.beginPath();
+    maskCtx.arc(mx, my, mr, 0, Math.PI * 2);
+    maskCtx.fill();
+    maskCtx.globalCompositeOperation = 'source-over';
+  }
+
+  function stroke(x0, y0, x1, y1, r) {
+    const dist = Math.hypot(x1 - x0, y1 - y0);
+    const step = Math.max(1, r * 0.25);
+    const n = Math.max(1, Math.ceil(dist / step));
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      const x = x0 + (x1 - x0) * t, y = y0 + (y1 - y0) * t;
+      stamp(x, y, r);
+      if (Math.random() < DRIP_CHANCE / Math.max(1, n / 4)) {
+        drips.push({
+          x: x + (Math.random() - 0.5) * r,
+          y: y + r * 0.6,
+          vy: 0,
+          r: 2 + Math.random() * 3,
+          life: 60 + Math.random() * 220,   // px of travel
+        });
+      }
+    }
+  }
+
+  function brushRadius(e) {
+    // Use the contact size on touch screens when available.
+    if (e.pointerType === 'touch' && e.width > 1) {
+      return Math.max(BRUSH_RADIUS * 0.8, Math.min(BRUSH_RADIUS * 1.8, e.width * 0.6));
+    }
+    return BRUSH_RADIUS;
+  }
+
+  // Add ?debug to the URL to see what the touch screen reports for each finger.
+  const DEBUG = new URLSearchParams(location.search).has('debug');
+  const debugEl = document.getElementById('debug');
+  debugEl.hidden = !DEBUG;
+  let debugLog = 'Touch the screen…';
+
+  function noteContact(p, e) {
+    p.w = e.width; p.h = e.height; p.pressure = e.pressure; p.type = e.pointerType;
+    if (!DEBUG) return;
+    debugLog = [...pointers.values()].map((q, i) =>
+      `#${i + 1} ${q.type}  ${q.w.toFixed(1)} × ${q.h.toFixed(1)} px  ` +
+      `pressure ${q.pressure.toFixed(2)}  brush r ${q.r.toFixed(1)}`).join('\n') || debugLog;
+    debugEl.textContent = debugLog;
+  }
+
+  function drawDebug() {
+    ctx.save();
+    ctx.scale(dpr, dpr);
+    ctx.lineWidth = 1.5;
+    for (const p of pointers.values()) {
+      ctx.strokeStyle = 'rgba(255,80,80,.9)';      // reported contact area
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, Math.max(1, p.w / 2), Math.max(1, p.h / 2), 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(120,220,255,.9)';    // brush actually used
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  view.addEventListener('pointerdown', e => {
+    try { view.setPointerCapture(e.pointerId); } catch {}
+    const r = brushRadius(e);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, r });
+    noteContact(pointers.get(e.pointerId), e);
+    stamp(e.clientX, e.clientY, r);
+  });
+  view.addEventListener('pointermove', e => {
+    const p = pointers.get(e.pointerId);
+    if (!p) return;
+    const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const ev of (events.length ? events : [e])) {
+      const r = brushRadius(ev);
+      p.r = p.r * 0.7 + r * 0.3;
+      stroke(p.x, p.y, ev.clientX, ev.clientY, p.r);
+      p.x = ev.clientX; p.y = ev.clientY;
+    }
+    noteContact(p, e);
+  });
+  const end = e => pointers.delete(e.pointerId);
+  view.addEventListener('pointerup', end);
+  view.addEventListener('pointercancel', end);
+  view.addEventListener('contextmenu', e => e.preventDefault());
+
+  function updateDrips(dt) {
+    for (let i = drips.length - 1; i >= 0; i--) {
+      const d = drips[i];
+      // Drips stutter: accelerate, then occasionally stall.
+      d.vy = Math.min(d.vy + 0.02 * dt, 0.12 * dt);
+      if (Math.random() < 0.02) d.vy *= 0.1;
+      const dy = d.vy;
+      const steps = Math.max(1, Math.ceil(dy / (d.r * 0.5)));
+      for (let s = 0; s < steps; s++) {
+        d.y += dy / steps;
+        d.x += (Math.random() - 0.5) * 0.15;
+        stamp(d.x, d.y, d.r, 0.85);
+      }
+      d.life -= dy;
+      if (d.life <= 0 || d.y > cssH + 10) drips.splice(i, 1);
+    }
+  }
+
+  // ---- Fog regrowth / breathing --------------------------------------------
+  let regrowAcc = 0;
+  let breathTimer = 0;
+
+  function regrow(dt) {
+    regrowAcc += dt;
+    let alpha = 0;
+    while (regrowAcc >= REGROW_EVERY_MS) { regrowAcc -= REGROW_EVERY_MS; alpha += REGROW_ALPHA; }
+    if (breathTimer > 0) { breathTimer -= dt; alpha += 0.06 * dt / 16; }
+    if (alpha > 0) {
+      maskCtx.globalCompositeOperation = 'source-over';
+      maskCtx.fillStyle = `rgba(255,255,255,${Math.min(1, alpha)})`;
+      maskCtx.fillRect(0, 0, mask.width, mask.height);
+    }
+  }
+
+  // ---- Blowing into the microphone -----------------------------------------
+  // Blowing on a mic is loud, low-frequency and noisy (a flat spectrum), whereas
+  // speech and music are tonal. We look for all three at once.
+  const BLOW_MIN_RMS = 0.04;      // absolute loudness floor
+  const BLOW_OVER_NOISE = 4;      // ... and this many times louder than the room
+  const BLOW_LOW_RATIO = 0.55;    // share of energy below ~500 Hz
+  const BLOW_FLATNESS = 0.45;     // spectral flatness below 500 Hz (0 = pure tone, 1 = white noise)
+
+  const micEl = document.getElementById('mic');
+  const micLevel = micEl.querySelector('i');
+  let audioCtx = null, analyser = null, timeBuf = null, freqBuf = null;
+  let noiseFloor = 0.01;
+  let blow = 0;          // smoothed blowing strength, 0..1
+  let blowHeld = 0;      // ms of continuous blowing, drives how far the patch spreads
+
+  async function startMic() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        video: false,
+      });
+      await audioCtx.resume();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyser.smoothingTimeConstant = 0.3;
+      audioCtx.createMediaStreamSource(stream).connect(analyser);
+      timeBuf = new Float32Array(analyser.fftSize);
+      freqBuf = new Float32Array(analyser.frequencyBinCount);
+      micEl.style.display = 'flex';
+    } catch (err) {
+      console.warn('Microphone unavailable, blowing disabled:', err);
+    }
+  }
+
+  function detectBlow() {
+    analyser.getFloatTimeDomainData(timeBuf);
+    let sum = 0;
+    for (let i = 0; i < timeBuf.length; i++) sum += timeBuf[i] * timeBuf[i];
+    const rms = Math.sqrt(sum / timeBuf.length);
+
+    analyser.getFloatFrequencyData(freqBuf);
+    const binHz = audioCtx.sampleRate / analyser.fftSize;
+    let low = 0, total = 0, logSum = 0, linSum = 0, n = 0;
+    for (let i = 1; i < freqBuf.length; i++) {
+      const hz = i * binHz;
+      if (hz > 4000) break;
+      const p = Math.pow(10, freqBuf[i] / 10) + 1e-12;
+      total += p;
+      if (hz < 500) low += p;
+      if (hz > 50 && hz < 500) { logSum += Math.log(p); linSum += p; n++; }
+    }
+    const lowRatio = low / (total || 1);
+    const flatness = n ? Math.exp(logSum / n) / (linSum / n) : 0;
+
+    const loudEnough = rms > Math.max(BLOW_MIN_RMS, noiseFloor * BLOW_OVER_NOISE);
+    const isBlow = loudEnough && lowRatio > BLOW_LOW_RATIO && flatness > BLOW_FLATNESS;
+
+    // Track the room's background level, but only while nobody is blowing.
+    if (!loudEnough) noiseFloor += (rms - noiseFloor) * (rms < noiseFloor ? 0.2 : 0.01);
+
+    const strength = isBlow ? Math.min(1, rms / 0.25) : 0;
+    micLevel.style.width = `${Math.min(100, rms / 0.3 * 100)}%`;
+    return strength;
+  }
+
+  // Breath condenses as an uneven patch around the middle that grows while you keep blowing.
+  function breatheOn(strength, dt) {
+    const cx = cssW / 2, cy = cssH * 0.5;
+    const maxR = Math.hypot(cssW, cssH) * 0.65;
+    const r = Math.min(maxR, 90 + blowHeld * 0.45);
+    maskCtx.globalCompositeOperation = 'source-over';
+    for (let i = 0; i < 4; i++) {
+      const a = Math.random() * Math.PI * 2, d = Math.random() * r * 0.25;
+      const x = (cx + Math.cos(a) * d) * MASK_SCALE, y = (cy + Math.sin(a) * d) * MASK_SCALE;
+      const rr = r * (0.8 + Math.random() * 0.4) * MASK_SCALE;
+      const grad = maskCtx.createRadialGradient(x, y, 0, x, y, rr);
+      const alpha = Math.min(1, strength * 0.05 * dt / 16);
+      grad.addColorStop(0, `rgba(255,255,255,${alpha})`);
+      grad.addColorStop(0.6, `rgba(255,255,255,${alpha * 0.7})`);
+      grad.addColorStop(1, 'rgba(255,255,255,0)');
+      maskCtx.fillStyle = grad;
+      maskCtx.fillRect(x - rr, y - rr, rr * 2, rr * 2);
+    }
+  }
+
+  function updateBreath(dt) {
+    if (!analyser) return;
+    const target = detectBlow();
+    blow += (target - blow) * (target > blow ? 0.5 : 0.15);
+    micEl.classList.toggle('blowing', blow > 0.05);
+    if (blow > 0.05) {
+      blowHeld += dt;
+      breatheOn(blow, dt);
+    } else {
+      blowHeld = Math.max(0, blowHeld - dt * 2);
+    }
+  }
+
+  document.getElementById('breathe').addEventListener('click', () => {
+    breathTimer = 900;
+    drips.length = 0;
+  });
+
+  function blurCamera() {
+    srcCtx.imageSmoothingQuality = 'high';
+    drawCover(srcCtx, src.width, src.height);
+    const bw = blur.width, bh = blur.height;
+    if (hasFilter) {
+      // Draw slightly oversized so the blur doesn't pull in transparent edges.
+      const r = BLUR_PX * BLUR_RES, m = r * 2;
+      blurCtx.filter = `blur(${r}px)`;
+      blurCtx.drawImage(src, -m, -m, bw + 2 * m, bh + 2 * m);
+      blurCtx.filter = 'none';
+      return;
+    }
+    let prev = src;
+    for (const c of pyramid) {
+      const g = c.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(prev, 0, 0, c.width, c.height);
+      prev = c;
+    }
+    for (let i = pyramid.length - 2; i >= 0; i--) {
+      const g = pyramid[i].getContext('2d');
+      g.drawImage(prev, 0, 0, pyramid[i].width, pyramid[i].height);
+      prev = pyramid[i];
+    }
+    blurCtx.imageSmoothingQuality = 'high';
+    blurCtx.drawImage(prev, 0, 0, bw, bh);
+  }
+
+  // ---- Render loop ----------------------------------------------------------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(50, now - last);
+    last = now;
+
+    regrow(dt);
+    updateBreath(dt);
+    updateDrips(dt);
+
+    const w = view.width, h = view.height;
+
+    // 1. Sharp mirrored camera.
+    drawCover(ctx, w, h);
+
+    // 2. Cheap, cross-browser blur: downscale twice, upscale with smoothing.
+    blurCamera();
+
+    // 3. Fog layer = blurred camera + pale tint + condensation grain, masked.
+    fogCtx.globalCompositeOperation = 'source-over';
+    fogCtx.imageSmoothingEnabled = true;
+    fogCtx.imageSmoothingQuality = 'high';
+    fogCtx.drawImage(blur, 0, 0, w, h);
+    fogCtx.fillStyle = FOG_TINT;
+    fogCtx.fillRect(0, 0, w, h);
+    if (grainPattern) {
+      fogCtx.globalAlpha = 0.35;
+      fogCtx.fillStyle = grainPattern;
+      fogCtx.fillRect(0, 0, w, h);
+      fogCtx.globalAlpha = 1;
+    }
+    fogCtx.globalCompositeOperation = 'destination-in';
+    fogCtx.drawImage(mask, 0, 0, w, h);
+    fogCtx.globalCompositeOperation = 'source-over';
+
+    // 4. Composite.
+    ctx.drawImage(fog, 0, 0);
+    if (DEBUG) drawDebug();
+
+    requestAnimationFrame(frame);
+  }
+
+  // ---- Startup --------------------------------------------------------------
+  const startEl = document.getElementById('start');
+  const msg = document.getElementById('msg');
+
+  async function start() {
+    msg.textContent = '';
+    msg.className = '';
+    if (!navigator.mediaDevices?.getUserMedia) {
+      msg.textContent = 'Camera access needs a secure page (https:// or localhost) and a modern browser.';
+      msg.className = 'error';
+      return;
+    }
+    // Must be created during the tap, or iOS keeps it suspended.
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC && !audioCtx) audioCtx = new AC();
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user', width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      startEl.style.display = 'none';
+      document.getElementById('controls').style.display = 'flex';
+      resize();
+      started = true;
+      last = performance.now();
+      requestAnimationFrame(frame);
+      if (audioCtx) startMic();
+    } catch (err) {
+      msg.textContent = err.name === 'NotAllowedError'
+        ? 'Camera permission was denied. Allow it in your browser settings and try again.'
+        : `Couldn't start the camera: ${err.message || err.name}`;
+      msg.className = 'error';
+    }
+  }
+
+  document.getElementById('go').addEventListener('click', start);
+  window.addEventListener('resize', () => { if (started) resize(); });
+})();
+</script>
+</body>
+</html>
